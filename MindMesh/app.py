@@ -15,17 +15,30 @@ Featuring:
 from __future__ import annotations
 from typing import Any, List, Optional
 import os
-import importlib
-from datetime import datetime, timezone
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
+import streamlit.components.v1 as components
+from dotenv import load_dotenv, set_key
 
 load_dotenv()
 
 from decay import fast_forward_record, is_due_for_review, get_review_interval_description
 from fetcher import CURATED_TOPICS, InternetQAProvider
-from notifier import default_notifier
+import sys
+import notifier
+try:
+    importlib.reload(notifier)
+except Exception:
+    pass
+
+try:
+    from notifier import NotificationResult, default_notifier, get_or_start_review_daemon
+except ImportError:
+    sys.modules.pop("notifier", None)
+    from notifier import NotificationResult, default_notifier, get_or_start_review_daemon
+
 from flow import FlowSession
 from models import State, Outcome, User
 from steps import (
@@ -336,6 +349,10 @@ st.markdown("""
 def get_store() -> Any:
     if "store" not in st.session_state or st.session_state.store is None:
         st.session_state.store = get_database_store()
+        try:
+            get_or_start_review_daemon(st.session_state.store, default_notifier)
+        except Exception:
+            pass
     return st.session_state.store
 
 
@@ -359,20 +376,29 @@ def get_cached_user_records(store: Any, username: str) -> List[Any]:
 def get_cached_concept_records(store: Any, concept_id: str, user_id: Optional[str] = None) -> List[Any]:
     key = f"cache_db_concept_recs_{concept_id}_{user_id}"
     if key not in st.session_state:
-        try:
-            st.session_state[key] = store.get_concept_records(concept_id, user_id=user_id)
-        except Exception:
-            return []
+        user_key = f"cache_db_user_recs_{user_id}" if user_id else None
+        if user_key and user_key in st.session_state and st.session_state[user_key] is not None:
+            st.session_state[key] = [r for r in st.session_state[user_key] if r.concept_id == concept_id]
+        else:
+            try:
+                st.session_state[key] = store.get_concept_records(concept_id, user_id=user_id)
+            except Exception:
+                return []
     return st.session_state[key]
 
 
 def get_cached_latest_concept_record(store: Any, concept_id: str, user_id: Optional[str] = None) -> Optional[Any]:
     key = f"cache_db_latest_rec_{concept_id}_{user_id}"
     if key not in st.session_state:
-        try:
-            st.session_state[key] = store.get_latest_concept_record(concept_id, user_id=user_id)
-        except Exception:
-            return None
+        user_key = f"cache_db_user_recs_{user_id}" if user_id else None
+        if user_key and user_key in st.session_state and st.session_state[user_key] is not None:
+            matching = [r for r in st.session_state[user_key] if r.concept_id == concept_id]
+            st.session_state[key] = matching[-1] if matching else None
+        else:
+            try:
+                st.session_state[key] = store.get_latest_concept_record(concept_id, user_id=user_id)
+            except Exception:
+                return None
     return st.session_state[key]
 
 
@@ -396,6 +422,45 @@ def get_cached_all_session_events(store: Any, user_id: Optional[str] = None) -> 
     return st.session_state[key]
 
 
+def format_review_datetime(review_dt: Optional[datetime]) -> str:
+    """Formats a review datetime into human-friendly local time with clear relative context."""
+    if not review_dt:
+        return "After 1st complete cycle"
+
+    if review_dt.tzinfo is None:
+        review_dt = review_dt.replace(tzinfo=timezone.utc)
+    local_dt = review_dt.astimezone()
+    now_local = datetime.now(timezone.utc).astimezone()
+
+    diff_sec = (review_dt - datetime.now(timezone.utc)).total_seconds()
+    time_str = local_dt.strftime("%I:%M %p").lstrip("0")
+    date_str = local_dt.strftime("%b %d")
+
+    if diff_sec <= 0:
+        return f"Due Now (since {date_str}, {time_str})"
+
+    is_today = local_dt.date() == now_local.date()
+    is_tomorrow = local_dt.date() == (now_local.date() + timedelta(days=1))
+
+    if diff_sec < 3600:
+        mins = max(1, int(round(diff_sec / 60)))
+        s = "s" if mins != 1 else ""
+        return f"In {mins} min{s} (Today at {time_str})"
+    elif is_today:
+        hrs = int(round(diff_sec / 3600))
+        s = "s" if hrs != 1 else ""
+        return f"In {hrs} hour{s} (Today at {time_str})"
+    elif is_tomorrow:
+        hrs = int(round(diff_sec / 3600))
+        if hrs >= 20:
+            return f"Tomorrow at {time_str} ({date_str})"
+        else:
+            return f"In {hrs} hours (Tomorrow at {time_str})"
+    else:
+        days = int(round(diff_sec / 86400))
+        return f"In {days} days ({date_str} at {time_str})"
+
+
 def get_provider() -> InternetQAProvider:
     if "provider" not in st.session_state:
         st.session_state.provider = InternetQAProvider()
@@ -409,6 +474,14 @@ def get_current_user() -> User:
             display_name="Guest Student",
             created_at=datetime.now(timezone.utc),
         )
+        if "guest_flushed" not in st.session_state:
+            try:
+                s = get_store()
+                s.flush_guest_data()
+                invalidate_db_cache()
+            except Exception:
+                pass
+            st.session_state["guest_flushed"] = True
     return st.session_state.current_user
 
 
@@ -444,20 +517,29 @@ def get_session() -> FlowSession:
 
         var_offset = st.session_state.get("topic_variation_offset", 0)
         enc_idx = len(prior_records) + var_offset
+        force_dyn = enc_idx > 0 or bool(prior_questions) or slug not in CURATED_TOPICS
 
         q = provider.get_question(
             cur_topic,
             encounter_index=enc_idx,
             prior_questions=prior_questions,
             shuffle=True,
-            force_dynamic=True,
+            force_dynamic=force_dyn,
         )
         step_prompting(session, question=q)
         st.session_state.flow_session = session
     return st.session_state.flow_session
 
 
-def reset_session(new_topic: str | None = None, advance_variation: bool = False):
+def reset_session(new_topic: str | None = None, advance_variation: bool = False, flush_guest: bool = False):
+    user = st.session_state.get("current_user")
+    if flush_guest or (user and user.username == "default_student" and not advance_variation and new_topic is None):
+        try:
+            s = get_store()
+            s.flush_guest_data()
+            invalidate_db_cache()
+        except Exception:
+            pass
     if new_topic and new_topic != st.session_state.get("current_topic"):
         st.session_state.current_topic = new_topic
         st.session_state["topic_variation_offset"] = 0
@@ -519,8 +601,62 @@ with st.sidebar:
     st.caption("Adaptive Learning Intelligence")
 
     if st.button("◀ Collapse Sidebar", key="btn_collapse_sidebar", use_container_width=True):
-        st.session_state["sidebar_collapsed"] = True
+        st.session_state["collapse_sidebar_triggered"] = True
         st.rerun()
+
+    # Client-side instantaneous collapse listener + rerun fallback
+    collapse_bridge_js = """
+    <script>
+    (function() {
+        function triggerNativeCollapse() {
+            try {
+                const pDoc = window.parent.document;
+                const btn = pDoc.querySelector('[data-testid="stSidebarCollapseButton"] button')
+                         || pDoc.querySelector('[data-testid="stSidebarCollapseButton"]')
+                         || pDoc.querySelector('button[kind="headerNoPadding"]')
+                         || pDoc.querySelector('section[data-testid="stSidebar"] button');
+                if (btn) {
+                    btn.click();
+                }
+            } catch(e) {}
+        }
+
+        function bindCollapseListener() {
+            try {
+                const pDoc = window.parent.document;
+                const buttons = pDoc.querySelectorAll('button');
+                for (let b of buttons) {
+                    if (b.innerText && b.innerText.includes('Collapse Sidebar') && !b.dataset.boundCollapse) {
+                        b.dataset.boundCollapse = 'true';
+                        b.addEventListener('click', function(e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            triggerNativeCollapse();
+                        }, true);
+                    }
+                }
+            } catch(e) {}
+        }
+        setInterval(bindCollapseListener, 250);
+        bindCollapseListener();
+    })();
+    </script>
+    """
+    components.html(collapse_bridge_js, height=0, width=0)
+
+    if st.session_state.pop("collapse_sidebar_triggered", False):
+        components.html("""
+        <script>
+        try {
+            const pDoc = window.parent.document;
+            const btn = pDoc.querySelector('[data-testid="stSidebarCollapseButton"] button')
+                     || pDoc.querySelector('[data-testid="stSidebarCollapseButton"]')
+                     || pDoc.querySelector('button[kind="headerNoPadding"]')
+                     || pDoc.querySelector('section[data-testid="stSidebar"] button');
+            if (btn) btn.click();
+        } catch(e) {}
+        </script>
+        """, height=0, width=0)
 
     st.divider()
 
@@ -542,23 +678,43 @@ with st.sidebar:
         if st.button("🎲 Next Q", use_container_width=True, help="Synthesize next non-repeating question"):
             reset_session(advance_variation=True)
 
-    st.markdown("##### Quick Topics")
-    quick_topics_data = [
-        ("Recursion", 82),
-        ("Binary Search", 61),
-        ("Graph Traversal", 42),
-        ("Dynamic Programming", 36),
-        ("Operating Systems", 28),
-        ("SQL", 22),
-    ]
-    for topic_name, mastery_pct in quick_topics_data:
-        q_c1, q_c2 = st.columns([2, 1])
-        with q_c1:
-            if st.button(f"📘 {topic_name}", key=f"qt_{topic_name}", use_container_width=True):
-                reset_session(new_topic=topic_name)
-        with q_c2:
-            st.caption(f"**{mastery_pct}%**")
-            st.progress(mastery_pct / 100.0)
+    # -----------------------------------------------------------------------
+    # Recently Learned Topics (User Requested)
+    # -----------------------------------------------------------------------
+    st.divider()
+    st.subheader("📚 Recently Learned Topics")
+    all_user_records_sb = get_cached_user_records(store, current_user.username)
+    recent_unique: List[Any] = []
+    seen_cids = set()
+    for r in sorted(all_user_records_sb, key=lambda x: x.created_at, reverse=True):
+        norm = r.concept_id.strip().lower()
+        if norm not in seen_cids:
+            seen_cids.add(norm)
+            recent_unique.append(r)
+
+    if recent_unique:
+        st.caption("Jump directly into a previously practiced topic:")
+        for rec in recent_unique[:6]:
+            cid = rec.concept_id
+            t_name = cid.replace("-", " ").replace("_", " ").title()
+            t_recs = [r for r in all_user_records_sb if r.concept_id.strip().lower() == cid.strip().lower()]
+            t_correct = sum(1 for r in t_recs if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
+            t_acc = int((t_correct / len(t_recs)) * 100) if t_recs else 0
+            is_active_topic = (current_topic_val.strip().lower() == t_name.lower() or current_topic_val.strip().lower() == cid.strip().lower())
+
+            status_icon = "🟢" if t_acc >= 80 else ("🟡" if t_acc >= 50 else "🔴")
+            btn_text = f"{'▶ ' if is_active_topic else ''}{status_icon} {t_name} ({t_acc}%)"
+
+            if st.button(
+                btn_text,
+                key=f"recent_top_{cid}",
+                use_container_width=True,
+                type="primary" if is_active_topic else "secondary",
+                help=f"{len(t_recs)} attempt{'s' if len(t_recs) != 1 else ''} • {t_acc}% accuracy • Click to practice {t_name}",
+            ):
+                reset_session(new_topic=t_name)
+    else:
+        st.caption("No topics completed yet. Practice any concept above to build your learning history!")
 
     st.divider()
 
@@ -574,6 +730,11 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    if is_guest:
+        if st.button("🧹 Flush Guest Session Data", key="btn_flush_guest_sidebar", use_container_width=True, help="Purges all session and practice data for this guest session"):
+            store.flush_guest_data()
+            invalidate_db_cache()
+            reset_session()
 
     st.markdown(
         """
@@ -612,13 +773,80 @@ with head_col2:
         unsafe_allow_html=True,
     )
 
-# Compute Student Aggregate Metrics for the Top Ribbon
+# Compute Student Metrics (Topic-Wise & Overall)
 all_user_records = get_cached_user_records(store, current_user.username)
-total_attempts = len(all_user_records)
-correct_count = sum(1 for r in all_user_records if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
-accuracy_pct = int((correct_count / total_attempts * 100)) if total_attempts > 0 else 78
-avg_confidence = round(sum(r.confidence for r in all_user_records) / total_attempts, 1) if total_attempts > 0 else 4.1
-mastery_pct = int((sum(1 for r in all_user_records if r.confidence >= 4 and r.outcome == Outcome.FIRST_TRY_CORRECT) / total_attempts * 100)) if total_attempts > 0 else 72
+active_topic_name = st.session_state.get("current_topic", "Recursion").strip()
+norm_active = active_topic_name.lower().replace("-", "_").replace(" ", "_")
+
+topic_records = [
+    r for r in all_user_records
+    if r.concept_id.lower().replace("-", "_").replace(" ", "_") == norm_active
+]
+
+t_attempts = len(topic_records)
+t_correct = sum(1 for r in topic_records if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
+t_acc_pct = int((t_correct / t_attempts * 100)) if t_attempts > 0 else 0
+t_avg_conf = round(sum(r.confidence for r in topic_records) / t_attempts, 1) if t_attempts > 0 else 0.0
+t_mastery_count = sum(1 for r in topic_records if r.confidence >= 4 and r.outcome == Outcome.FIRST_TRY_CORRECT)
+t_mastery_pct = int((t_mastery_count / t_attempts * 100)) if t_attempts > 0 else 0
+
+o_attempts = len(all_user_records)
+o_correct = sum(1 for r in all_user_records if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
+o_acc_pct = int((o_correct / o_attempts * 100)) if o_attempts > 0 else 0
+o_avg_conf = round(sum(r.confidence for r in all_user_records) / o_attempts, 1) if o_attempts > 0 else 0.0
+o_mastery_count = sum(1 for r in all_user_records if r.confidence >= 4 and r.outcome == Outcome.FIRST_TRY_CORRECT)
+o_mastery_pct = int((o_mastery_count / o_attempts * 100)) if o_attempts > 0 else 0
+
+if "stats_scope" not in st.session_state:
+    st.session_state["stats_scope"] = "topic"
+
+scope_row1, scope_row2 = st.columns([3, 1])
+with scope_row1:
+    if st.session_state["stats_scope"] == "topic":
+        st.markdown(
+            f"""
+            <div style='display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;'>
+                <h3 style='margin: 0; color: #F8FAFC; font-size: 1.15rem;'>🎯 Topic Stats: <span style='color: #818CF8;'>{active_topic_name.title()}</span></h3>
+                <small style='color: #64748B;'>({t_attempts} on this topic • {o_attempts} all-time)</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div style='display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px;'>
+                <h3 style='margin: 0; color: #F8FAFC; font-size: 1.15rem;'>🌐 Overall Performance: <span style='color: #818CF8;'>All Concepts</span></h3>
+                <small style='color: #64748B;'>(Active concept: {active_topic_name.title()})</small>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+with scope_row2:
+    scope_choice = st.segmented_control(
+        "Performance Scope",
+        options=["🎯 Topic-Wise", "🌐 All Topics"],
+        default="🎯 Topic-Wise" if st.session_state["stats_scope"] == "topic" else "🌐 All Topics",
+        key="stats_scope_ctrl",
+        label_visibility="collapsed",
+    )
+    st.session_state["stats_scope"] = "topic" if scope_choice == "🎯 Topic-Wise" else "all"
+
+is_topic_scope = (st.session_state["stats_scope"] == "topic")
+
+disp_attempts = t_attempts if is_topic_scope else o_attempts
+disp_acc = t_acc_pct if is_topic_scope else o_acc_pct
+disp_correct = t_correct if is_topic_scope else o_correct
+disp_conf = t_avg_conf if is_topic_scope else o_avg_conf
+disp_mast_pct = t_mastery_pct if is_topic_scope else o_mastery_pct
+disp_mast_cnt = t_mastery_count if is_topic_scope else o_mastery_count
+
+lbl_attempts = f"Topic Questions" if is_topic_scope else "Questions Attempted"
+trend_attempts = f"{disp_attempts} attempts" if disp_attempts > 0 else "New topic"
+trend_acc = f"{disp_correct}/{disp_attempts} solved" if disp_attempts > 0 else "0 solved"
+trend_conf = f"Self-rated ({active_topic_name.title()})" if is_topic_scope and disp_attempts > 0 else ("Self-rated" if disp_attempts > 0 else "Unrated")
+val_conf = f"{disp_conf}/5" if disp_attempts > 0 else "0.0/5"
+trend_mast = f"{disp_mast_cnt} mastered" if disp_attempts > 0 else "0 mastered"
 
 # 4 Stat Cards Row
 s_c1, s_c2, s_c3, s_c4 = st.columns(4)
@@ -628,8 +856,8 @@ with s_c1:
         <div class='stat-box'>
             <div class='stat-icon' style='background: rgba(56, 189, 248, 0.15); color: #38BDF8;'>📝</div>
             <div>
-                <div class='stat-label'>Questions Attempted</div>
-                <div class='stat-val'>{max(total_attempts, 12)} <span class='stat-trend'>↑ +3</span></div>
+                <div class='stat-label'>{lbl_attempts}</div>
+                <div class='stat-val'>{disp_attempts} <span class='stat-trend'>{trend_attempts}</span></div>
             </div>
         </div>
         """,
@@ -642,7 +870,7 @@ with s_c2:
             <div class='stat-icon' style='background: rgba(139, 92, 246, 0.15); color: #A78BFA;'>🎯</div>
             <div>
                 <div class='stat-label'>Accuracy</div>
-                <div class='stat-val'>{accuracy_pct}% <span class='stat-trend'>↑ +8%</span></div>
+                <div class='stat-val'>{disp_acc}% <span class='stat-trend'>{trend_acc}</span></div>
             </div>
         </div>
         """,
@@ -655,7 +883,7 @@ with s_c3:
             <div class='stat-icon' style='background: rgba(99, 102, 241, 0.15); color: #818CF8;'>🧠</div>
             <div>
                 <div class='stat-label'>Avg. Confidence</div>
-                <div class='stat-val'>{avg_confidence}/5 <span class='stat-trend'>↑ +0.4</span></div>
+                <div class='stat-val'>{val_conf} <span class='stat-trend'>{trend_conf}</span></div>
             </div>
         </div>
         """,
@@ -668,7 +896,7 @@ with s_c4:
             <div class='stat-icon' style='background: rgba(245, 158, 11, 0.15); color: #FBBF24;'>⭐</div>
             <div>
                 <div class='stat-label'>Mastery</div>
-                <div class='stat-val'>{mastery_pct}% <span class='stat-trend'>↑ +11%</span></div>
+                <div class='stat-val'>{disp_mast_pct}% <span class='stat-trend'>{trend_mast}</span></div>
             </div>
         </div>
         """,
@@ -1111,30 +1339,75 @@ with nav_tab1:
     # RIGHT COLUMN: AI Decision & Spaced Repetition Next Revision Panel
     # -----------------------------------------------------------------------
     with col_side:
-        # AI Decision Card (Matching User Image 1 Right-Side)
+        # AI Decision Card (Topic-Wise & Dynamic)
         has_mismatch = any(v.is_mismatch for v in flow.verdicts)
+        display_topic_label = flow.question.topic_name if (flow.question and flow.question.topic_name) else current_cid.replace("-", " ").replace("_", " ").title()
+
+        norm_cid = current_cid.lower().replace("-", "_").replace(" ", "_")
+        c_topic_recs = [r for r in all_user_records if r.concept_id.lower().replace("-", "_").replace(" ", "_") == norm_cid]
+        c_attempts = len(c_topic_recs)
+        c_correct = sum(1 for r in c_topic_recs if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
+        c_acc = int((c_correct / c_attempts * 100)) if c_attempts > 0 else 0
+        c_avg_conf = round(sum(r.confidence for r in c_topic_recs) / c_attempts, 1) if c_attempts > 0 else 0.0
+
+        latest_rec = get_cached_latest_concept_record(store, current_cid, user_id=flow.user_id)
+        is_due = is_due_for_review(latest_rec) if latest_rec else False
+
+        if has_mismatch:
+            learning_state_text = "Concept Gap"
+            learning_state_color = "#F87171"
+            next_action_text = "⬅️ Step Back & Clarify"
+            rec_action_text = f"Targeted follow-up to solidify foundational concepts in {display_topic_label}."
+        elif latest_rec and is_due:
+            learning_state_text = "Due Revision"
+            learning_state_color = "#F59E0B"
+            next_action_text = "🔄 Reinforce Topic"
+            rec_action_text = f"Topic {display_topic_label} is due for active recall review! Complete reinforcement question."
+        elif c_attempts > 0 and c_acc >= 80 and c_avg_conf >= 4.0:
+            learning_state_text = "Mastered"
+            learning_state_color = "#34D399"
+            next_action_text = "➡️ Advance Loop"
+            rec_action_text = f"High proficiency achieved in {display_topic_label}. Spaced repetition interval extended."
+        elif c_attempts > 0:
+            learning_state_text = "Calibrated"
+            learning_state_color = "#34D399"
+            next_action_text = "➡️ Advance Loop"
+            rec_action_text = f"Maintain reinforcement pace on {display_topic_label} spaced repetition."
+        else:
+            learning_state_text = "Initial Baseline"
+            learning_state_color = "#38BDF8"
+            next_action_text = "🎯 First Evaluation"
+            rec_action_text = f"Complete active recall questions to establish your baseline in {display_topic_label}."
+
+        conf_sub = f" <span style='color: #64748B; font-weight: 400; font-size: 0.75rem;'>(Avg: {c_avg_conf}/5)</span>" if c_attempts > 0 else ""
+
         st.markdown(
             f"""
             <div class='mm-card'>
-                <div style='display: flex; align-items: center; gap: 8px; margin-bottom: 12px;'>
-                    <span style='font-size: 1.2rem;'>🤖</span>
-                    <span style='font-weight: 700; color: #F8FAFC;'>AI Decision Engine</span>
+                <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;'>
+                    <div style='display: flex; align-items: center; gap: 8px;'>
+                        <span style='font-size: 1.2rem;'>🤖</span>
+                        <span style='font-weight: 700; color: #F8FAFC;'>AI Decision Engine</span>
+                    </div>
+                    <span style='background: rgba(99, 102, 241, 0.15); color: #818CF8; font-size: 0.75rem; font-weight: 600; padding: 2px 8px; border-radius: 8px;'>
+                        {display_topic_label}
+                    </span>
                 </div>
                 <div style='background: #0B0F19; border: 1px solid #1E293B; border-radius: 8px; padding: 12px; margin-bottom: 12px;'>
                     <div style='display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 6px;'>
                         <span style='color: #94A3B8;'>Confidence Level</span>
-                        <span style='color: #818CF8; font-weight: 700;'>{st.session_state.get('rating_slider', 4)}/5</span>
+                        <span style='color: #818CF8; font-weight: 700;'>{st.session_state.get('rating_slider', 4)}/5{conf_sub}</span>
                     </div>
                     <div style='width: 100%; background: #1E293B; border-radius: 4px; height: 6px;'>
                         <div style='width: {st.session_state.get("rating_slider", 4) * 20}%; background: linear-gradient(90deg, #6366F1, #38BDF8); height: 6px; border-radius: 4px;'></div>
                     </div>
                     <div style='display: flex; justify-content: space-between; font-size: 0.82rem; margin-top: 10px;'>
                         <span style='color: #94A3B8;'>Learning State</span>
-                        <span style='font-weight: 600; color: {"#F87171" if has_mismatch else "#34D399"};'>{"Concept Gap" if has_mismatch else "Calibrated"}</span>
+                        <span style='font-weight: 600; color: {learning_state_color};'>{learning_state_text}</span>
                     </div>
                     <div style='display: flex; justify-content: space-between; font-size: 0.82rem; margin-top: 6px;'>
                         <span style='color: #94A3B8;'>Next Action</span>
-                        <span style='font-weight: 600; color: #38BDF8;'>{"⬅️ Step Back & Clarify" if has_mismatch else "➡️ Advance Loop"}</span>
+                        <span style='font-weight: 600; color: #38BDF8;'>{next_action_text}</span>
                     </div>
                     <div style='display: flex; justify-content: space-between; font-size: 0.82rem; margin-top: 6px;'>
                         <span style='color: #94A3B8;'>Live Grader</span>
@@ -1144,7 +1417,7 @@ with nav_tab1:
                 <div style='background: rgba(99, 102, 241, 0.1); border: 1px solid rgba(99, 102, 241, 0.25); border-radius: 8px; padding: 10px 12px;'>
                     <div style='font-size: 0.8rem; color: #818CF8; font-weight: 600;'>💡 Recommended Action:</div>
                     <div style='font-size: 0.8rem; color: #CBD5E1; margin-top: 4px;'>
-                        {"Targeted follow-up to solidify base case condition." if has_mismatch else "Maintain reinforcement pace on spaced repetition."}
+                        {rec_action_text}
                     </div>
                 </div>
             </div>
@@ -1158,16 +1431,7 @@ with nav_tab1:
         latest_rec = get_cached_latest_concept_record(store, current_cid, user_id=flow.user_id)
         is_due = is_due_for_review(latest_rec) if latest_rec else False
         if latest_rec:
-            if is_due:
-                due_str = f"Due Now (overdue since {latest_rec.next_review_at.strftime('%b %d, %H:%M')})"
-            else:
-                diff = latest_rec.next_review_at - datetime.now(timezone.utc)
-                days = diff.days
-                if days > 0:
-                    due_str = f"In {days} day{'s' if days > 1 else ''} ({latest_rec.next_review_at.strftime('%b %d')})"
-                else:
-                    hrs = max(1, int(diff.total_seconds() // 3600))
-                    due_str = f"In {hrs} hour{'s' if hrs > 1 else ''} ({latest_rec.next_review_at.strftime('%H:%M')})"
+            due_str = format_review_datetime(latest_rec.next_review_at)
         else:
             due_str = "After 1st complete cycle"
         status_color = "#EF4444" if is_due else "#10B981"
@@ -1214,25 +1478,65 @@ with nav_tab1:
 
         # Email Notification dispatch button on card
         if current_user and getattr(current_user, "email", None):
-            st.caption(f"📧 Reminders: `{current_user.email}`")
-            if st.button("📧 Send Review Reminder Now", key="btn_send_review_card", use_container_width=True, help="Dispatches a formatted spaced repetition revision email"):
+            is_live_smtp = default_notifier.is_live_smtp_enabled()
+            mode_badge = "🟢 Live SMTP" if is_live_smtp else "🟡 Simulated Mode"
+            st.caption(f"📧 Reminders: `{current_user.email}` ({mode_badge})")
+            col_mail_btn1, col_mail_btn2 = st.columns([3, 2])
+            with col_mail_btn1:
+                send_now_clicked = st.button("📧 Send Review Reminder Now", key="btn_send_review_card", use_container_width=True, help="Dispatches a formatted spaced repetition revision email")
+            with col_mail_btn2:
+                preview_clicked = st.button("👁️ Preview Email", key="btn_preview_email_card", use_container_width=True, help="Previews the formatted email without sending")
+
+            topic_str = (flow.question.topic_name if (flow.question and getattr(flow.question, "topic_name", None)) else current_cid)
+
+            if send_now_clicked:
                 if latest_rec:
                     notif = default_notifier.send_review_reminder(
                         recipient=current_user.email,
                         student_name=current_user.display_name,
                         concept_id=current_cid,
-                        topic_name=current_q.topic_name if current_q else current_cid,
+                        topic_name=topic_str,
                         outcome=latest_rec.outcome,
                         confidence=latest_rec.confidence,
                         next_review_at=latest_rec.next_review_at,
                     )
+                    st.session_state["card_email_preview"] = notif
                     if notif.success:
-                        mode_label = "Live SMTP" if notif.mode == "smtp" else "Simulated Delivery"
-                        st.success(f"Email reminder sent to `{current_user.email}` ({mode_label})!")
+                        if notif.mode == "smtp":
+                            st.success(f"✅ Real email delivered to `{current_user.email}` via `{default_notifier.smtp_host}`!")
+                        else:
+                            st.warning(f"⚠️ **Simulated Mode (Not Sent to Physical Inbox)**: MindMesh generated and logged your review reminder for **{current_cid}**, but no SMTP server is configured in `.env` or Settings. Configure SMTP credentials in **Tab 4 (Settings)** to receive real emails in your inbox.")
                     else:
-                        st.error(f"Failed to send email: {notif.error}")
+                        st.error(f"❌ Failed to send email: {notif.error}")
                 else:
                     st.info("Complete an encounter first to establish your confidence rating and review schedule.")
+
+            if preview_clicked:
+                subj, txt_b, html_b = default_notifier.format_review_email(
+                    student_name=current_user.display_name,
+                    concept_id=current_cid,
+                    topic_name=topic_str,
+                    outcome=latest_rec.outcome if latest_rec else Outcome.FIRST_TRY_CORRECT,
+                    confidence=latest_rec.confidence if latest_rec else 4,
+                    next_review_at=latest_rec.next_review_at if latest_rec else datetime.now(timezone.utc),
+                )
+                st.session_state["card_email_preview"] = NotificationResult(
+                    success=True,
+                    recipient=current_user.email,
+                    subject=subj,
+                    mode="preview",
+                    body_text=txt_b,
+                    body_html=html_b,
+                    concept_id=current_cid,
+                    topic_name=topic_str,
+                )
+
+            if "card_email_preview" in st.session_state and st.session_state["card_email_preview"]:
+                prev = st.session_state["card_email_preview"]
+                with st.expander(f"📬 Email Preview: {prev.subject}", expanded=True):
+                    if prev.mode == "simulated":
+                        st.info("ℹ️ **Simulated Delivery**: Outgoing SMTP host is unset. Configure SMTP credentials in **Tab 4 (Settings)** to receive live emails in your inbox.")
+                    components.html(prev.body_html or "", height=380, scrolling=True)
         else:
             st.caption("📧 *Tip: Add an email in Settings to get automated review reminders.*")
 
@@ -1284,7 +1588,8 @@ with nav_tab2:
                 icon = "✅" if is_ok else "❌"
                 badge_bg = "rgba(16, 185, 129, 0.15)" if is_ok else "rgba(239, 68, 68, 0.15)"
                 badge_color = "#34D399" if is_ok else "#F87171"
-                due_flag = "⚠️ Due for review" if is_due_for_review(r) else f"Due {r.next_review_at.strftime('%b %d')}"
+                due_flag = "⚠️ Due for review" if is_due_for_review(r) else f"Due {format_review_datetime(r.next_review_at)}"
+                created_str = r.created_at.astimezone().strftime('%b %d, %I:%M %p')
 
                 st.markdown(
                     f"""
@@ -1295,7 +1600,7 @@ with nav_tab2:
                         <div class='timeline-content'>
                             <div style='display: flex; justify-content: space-between; align-items: baseline;'>
                                 <strong style='color: #F8FAFC; font-size: 0.95rem;'>{r.concept_id}</strong>
-                                <small style='color: #64748B;'>{r.created_at.strftime('%Y-%m-%d %H:%M')}</small>
+                                <small style='color: #64748B;'>{created_str}</small>
                             </div>
                             <div style='display: flex; gap: 12px; margin-top: 4px; font-size: 0.8rem; color: #94A3B8;'>
                                 <span>Outcome: <strong style='color: {badge_color};'>{r.outcome.value}</strong></span>
@@ -1319,7 +1624,7 @@ with nav_tab2:
                     "State": ev.state.value,
                     "Event Type": ev.event_type,
                     "Payload": str(ev.payload)[:90] + "..." if len(str(ev.payload)) > 90 else str(ev.payload),
-                    "Timestamp": ev.timestamp.strftime("%H:%M:%S UTC"),
+                    "Timestamp": ev.timestamp.astimezone().strftime("%I:%M:%S %p"),
                 }
                 for ev in events
             ]
@@ -1337,58 +1642,108 @@ with nav_tab3:
 
     col_p1, col_p2 = st.columns([1, 1])
 
+    all_user_records = get_cached_user_records(store, current_user.username)
+
+    # Aggregate topic-level metrics dynamically
+    topic_groups: Dict[str, List[Any]] = {}
+    for rec in all_user_records:
+        topic_groups.setdefault(rec.concept_id, []).append(rec)
+
+    topic_stats = []
+    for cid, recs in topic_groups.items():
+        t_attempts = len(recs)
+        t_correct = sum(1 for r in recs if r.outcome in (Outcome.FIRST_TRY_CORRECT, Outcome.RESOLVED_ON_FOLLOW_UP))
+        t_pct = int((t_correct / t_attempts) * 100) if t_attempts > 0 else 0
+        t_avg_conf = round(sum(r.confidence for r in recs) / t_attempts, 1) if t_attempts > 0 else 0.0
+
+        display_topic = cid.replace("-", " ").replace("_", " ").title()
+
+        if t_pct >= 80 and t_avg_conf >= 3.5:
+            rating_text = "Strong"
+            badge_bg = "rgba(16, 185, 129, 0.15)"
+            badge_clr = "#34D399"
+        elif t_pct >= 50:
+            rating_text = "Developing"
+            badge_bg = "rgba(245, 158, 11, 0.15)"
+            badge_clr = "#FBBF24"
+        else:
+            rating_text = "Needs Practice"
+            badge_bg = "rgba(239, 68, 68, 0.15)"
+            badge_clr = "#F87171"
+
+        topic_stats.append({
+            "concept_id": cid,
+            "name": display_topic,
+            "pct": t_pct,
+            "avg_conf": t_avg_conf,
+            "attempts": t_attempts,
+            "rating_text": rating_text,
+            "badge_bg": badge_bg,
+            "badge_clr": badge_clr,
+        })
+
+    # Sort topics by lowest accuracy first so areas needing attention are prioritized
+    topic_stats.sort(key=lambda x: (x["pct"], x["avg_conf"]))
+
     with col_p1:
         st.markdown("<div class='mm-card'>", unsafe_allow_html=True)
         st.markdown("#### Topic-Wise Performance")
-        sample_topics = [
-            ("Recursion", 82, "Strong"),
-            ("Binary Search", 61, "Developing"),
-            ("Graph Traversal", 42, "Needs Practice"),
-            ("Dynamic Programming", 36, "Needs Practice"),
-            ("Operating Systems", 28, "Needs Practice"),
-            ("SQL", 22, "Needs Practice"),
-        ]
-        for t_name, pct, rating_text in sample_topics:
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                st.write(f"**{t_name}**")
-                st.progress(pct / 100.0)
-            with c2:
-                badge_bg = "rgba(16, 185, 129, 0.15)" if pct >= 70 else ("rgba(245, 158, 11, 0.15)" if pct >= 40 else "rgba(239, 68, 68, 0.15)")
-                badge_clr = "#34D399" if pct >= 70 else ("#FBBF24" if pct >= 40 else "#F87171")
-                st.markdown(f"<span style='background: {badge_bg}; color: {badge_clr}; padding: 2px 8px; border-radius: 8px; font-size: 0.75rem;'>{rating_text}</span>", unsafe_allow_html=True)
+        if topic_stats:
+            for t_item in topic_stats:
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.write(f"**{t_item['name']}** <span style='color: #94A3B8; font-size: 0.8rem;'>({t_item['attempts']} attempt{'s' if t_item['attempts'] != 1 else ''})</span>", unsafe_allow_html=True)
+                    st.progress(t_item["pct"] / 100.0)
+                with c2:
+                    st.markdown(f"<span style='background: {t_item['badge_bg']}; color: {t_item['badge_clr']}; padding: 2px 8px; border-radius: 8px; font-size: 0.75rem;'>{t_item['rating_text']} ({t_item['pct']}%)</span>", unsafe_allow_html=True)
+        else:
+            st.info("No practice records found for this account yet. Practice any topic from the topic engine to begin tracking your mastery!")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_p2:
         st.markdown("<div class='mm-card'>", unsafe_allow_html=True)
         st.markdown("#### 🎯 Next Recommended Topic")
+
+        if topic_stats:
+            rec_target = topic_stats[0]
+            rec_topic_name = rec_target["name"]
+            if rec_target["pct"] < 80:
+                rec_desc = f"Based on your current accuracy ({rec_target['pct']}%) and confidence ({rec_target['avg_conf']}/5), <strong>{rec_topic_name}</strong> is your top priority for reinforcement."
+            else:
+                rec_desc = f"Great work! You have solid proficiency across topics. Reviewing <strong>{rec_topic_name}</strong> will reinforce long-term mastery."
+        else:
+            rec_topic_name = "Recursion"
+            rec_desc = "Get started with fundamental algorithmic thinking. Practice Recursion to establish your baseline performance metrics."
+
         st.markdown(
-            """
+            f"""
             <div style='background: #0F1629; border: 1px solid #312E81; border-radius: 10px; padding: 14px;'>
-                <div style='font-size: 1.1rem; font-weight: 700; color: #818CF8;'>Graph Traversal (BFS / DFS)</div>
+                <div style='font-size: 1.1rem; font-weight: 700; color: #818CF8;'>{rec_topic_name}</div>
                 <div style='color: #94A3B8; font-size: 0.85rem; margin-top: 4px;'>
-                    Based on your confidence pattern in recursion and tree bounds, Graph Traversal is optimal to reinforce today.
+                    {rec_desc}
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
         st.write("")
-        if st.button("Start Practice: Graph Traversal →", type="primary", use_container_width=True):
-            reset_session(new_topic="Graph Traversal")
+        if st.button(f"Start Practice: {rec_topic_name} →", type="primary", use_container_width=True):
+            reset_session(new_topic=rec_topic_name)
 
         st.divider()
 
         st.markdown("#### Spaced Repetition Due Queue")
-        all_recs = get_cached_user_records(store, current_user.username)
-        due_recs = [r for r in all_recs if is_due_for_review(r)]
+        due_recs = [r for r in all_user_records if is_due_for_review(r)]
         if due_recs:
             st.error(f"You have **{len(due_recs)} concept(s)** due for reinforcement right now!")
             if current_user and getattr(current_user, "email", None):
                 if st.button("📧 Email Me All Due Reviews", key="btn_email_due_queue", use_container_width=True):
                     notifs = default_notifier.notify_due_reviews_for_user(store, current_user)
                     sent_count = sum(1 for n in notifs if n.success)
-                    st.success(f"Dispatched {sent_count} review notification(s) to `{current_user.email}`!")
+                    if default_notifier.is_live_smtp_enabled():
+                        st.success(f"✅ Dispatched {sent_count} review notification(s) to `{current_user.email}` via SMTP!")
+                    else:
+                        st.warning(f"⚠️ Generated {sent_count} notification(s) in **Simulated Delivery Mode** (SMTP_HOST unset). Configure SMTP in **Tab 4 (Settings)** to deliver real emails to your inbox.")
             for d in due_recs:
                 if st.button(f"Review Due: {d.concept_id}", key=f"due_btn_{d.concept_id}", use_container_width=True):
                     reset_session(new_topic=d.concept_id)
@@ -1444,7 +1799,11 @@ with nav_tab4:
                     display_name="Guest Student",
                     created_at=datetime.now(timezone.utc),
                 )
-                reset_session()
+                try:
+                    store.flush_guest_data()
+                except Exception:
+                    pass
+                reset_session(flush_guest=True)
         else:
             st.info("Currently studying in **Guest Mode**.")
             auth_mode = st.radio("Action", ["Log In", "Create New Account"], horizontal=True)
@@ -1479,12 +1838,92 @@ with nav_tab4:
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("<div class='mm-card'>", unsafe_allow_html=True)
-        st.markdown("#### 📧 Spaced Repetition Email Dispatcher")
-        st.caption("Automated email dispatch for overdue concepts based on confidence levels.")
+        st.markdown("#### 📧 Live SMTP Email Delivery & Automated Review Daemon")
+        st.caption("Configure outgoing mail server (e.g. Gmail App Password, Brevo, SendGrid, or custom SMTP) to deliver spaced repetition reminders to your inbox.")
 
-        mode_badge = "🟢 Live SMTP Delivery" if default_notifier.is_live_smtp_enabled() else "🟡 Simulated Delivery (Zero-Crash Fallback)"
-        st.caption(f"Service Mode: **{mode_badge}**")
+        is_live = default_notifier.is_live_smtp_enabled()
+        if is_live:
+            st.success(f"🟢 **Live SMTP Active** (`{default_notifier.smtp_host}:{default_notifier.smtp_port}` as `{default_notifier.smtp_user or 'anonymous'}`)")
+        else:
+            st.warning("🟡 **Simulated Delivery Mode**: Outgoing SMTP host is unset. MindMesh generates and logs reminder emails locally without network transmission.")
 
+        # Automated Daemon status
+        daemon = get_or_start_review_daemon(store, default_notifier)
+        daemon_status = "🟢 Active (Auto-polling every 120s)" if daemon.is_running else "🔴 Stopped"
+        last_check_str = daemon.last_check_at.astimezone().strftime("%I:%M:%S %p") if daemon.last_check_at else "Scanning now..."
+        st.caption(f"🤖 **Automated Review Daemon**: {daemon_status} • Last scan: `{last_check_str}`")
+
+        with st.expander("⚙️ Configure SMTP Server Credentials", expanded=not is_live):
+            with st.form("smtp_config_form"):
+                cfg_host = st.text_input("SMTP Host", value=default_notifier.smtp_host or "smtp.gmail.com", help="e.g. smtp.gmail.com, smtp.office365.com, or smtp.mailgun.org")
+                cfg_port = st.number_input("SMTP Port", value=default_notifier.smtp_port or 587, min_value=1, max_value=65535, step=1, help="Usually 587 (STARTTLS) or 465 (SSL)")
+                cfg_user = st.text_input("SMTP Username / Email", value=default_notifier.smtp_user or (current_user.email or "" if current_user else ""), help="Your full email address for SMTP authentication")
+                cfg_pass = st.text_input("SMTP Password / App Password", value=default_notifier.smtp_password or "", type="password", help="For Gmail, use a 16-character Google App Password (not your account password)")
+                cfg_from = st.text_input("Sender 'From' Email", value=default_notifier.smtp_from or "notifications@mindmesh.local", help="Email displayed in the From: header")
+                cfg_tls = st.checkbox("Enable STARTTLS (Recommended for port 587)", value=default_notifier.smtp_use_tls)
+
+                st.caption("💡 *Tip for Gmail users: Enable 2-Step Verification in Google Account -> Security -> App Passwords -> Generate a 16-letter App Password.*")
+
+                if st.form_submit_button("💾 Save SMTP Settings to .env & Apply", use_container_width=True):
+                    default_notifier.configure_smtp(
+                        smtp_host=cfg_host,
+                        smtp_port=int(cfg_port),
+                        smtp_user=cfg_user,
+                        smtp_password=cfg_pass,
+                        smtp_from=cfg_from,
+                        smtp_use_tls=cfg_tls,
+                    )
+                    # Persist to .env
+                    try:
+                        dotenv_path = Path(".env")
+                        if not dotenv_path.exists():
+                            dotenv_path.touch()
+                        set_key(str(dotenv_path), "SMTP_HOST", cfg_host.strip())
+                        set_key(str(dotenv_path), "SMTP_PORT", str(cfg_port))
+                        set_key(str(dotenv_path), "SMTP_USER", cfg_user.strip())
+                        set_key(str(dotenv_path), "SMTP_PASSWORD", cfg_pass.strip())
+                        set_key(str(dotenv_path), "SMTP_FROM", cfg_from.strip())
+                        set_key(str(dotenv_path), "SMTP_USE_TLS", "true" if cfg_tls else "false")
+                        st.success("✅ SMTP credentials applied to active runtime and saved to `.env`!")
+                    except Exception as exc:
+                        st.warning(f"Applied to runtime, but could not write to .env: {exc}")
+                    st.rerun()
+
+        # Immediate Test Connection Button
+        st.markdown("<div style='margin-top: 10px; font-weight: 600; font-size: 0.85rem; color: #E2E8F0;'>🧪 Test Real Email Delivery</div>", unsafe_allow_html=True)
+        col_t1, col_t2 = st.columns([3, 2])
+        with col_t1:
+            test_recipient = st.text_input("Test Recipient Email", value=current_user.email or "" if current_user else "", placeholder="student@example.com", key="input_test_recipient")
+        with col_t2:
+            st.write("")
+            st.write("")
+            test_clicked = st.button("🚀 Send Test Email", key="btn_send_test_email", use_container_width=True)
+
+        if test_clicked:
+            if not test_recipient.strip():
+                st.error("Please enter a recipient email address to send test to.")
+            else:
+                with st.spinner("Connecting to mail server and sending test email..."):
+                    test_res = default_notifier.send_review_reminder(
+                        recipient=test_recipient.strip(),
+                        student_name=current_user.display_name if current_user else "MindMesh Student",
+                        concept_id="mindmesh_diagnostics",
+                        topic_name="Spaced Repetition System Verification",
+                        outcome=Outcome.FIRST_TRY_CORRECT,
+                        confidence=5,
+                        next_review_at=datetime.now(timezone.utc),
+                    )
+                if test_res.success:
+                    if test_res.mode == "smtp":
+                        st.success(f"🎉 **Success!** Real email delivered to `{test_recipient}` via `{default_notifier.smtp_host}`!")
+                    else:
+                        st.warning(f"⚠️ Formatted email generated, but in **Simulated Delivery Mode** (SMTP_HOST unset). Configure credentials above to receive it in your real inbox.")
+                else:
+                    st.error(f"❌ SMTP Error: {test_res.error}")
+
+        st.divider()
+
+        st.markdown("<div style='font-weight: 600; font-size: 0.85rem; color: #E2E8F0; margin-bottom: 4px;'>📤 Due Review Scan</div>", unsafe_allow_html=True)
         if not is_guest and getattr(current_user, "email", None):
             if st.button("📤 Scan & Dispatch Due Reviews for My Account", use_container_width=True):
                 notifs = default_notifier.notify_due_reviews_for_user(store, current_user)
@@ -1493,7 +1932,10 @@ with nav_tab4:
                 else:
                     for n in notifs:
                         if n.success:
-                            st.success(f"Dispatched reminder for **{n.concept_id}** to `{n.recipient}` ({n.mode} mode)!")
+                            if n.mode == "smtp":
+                                st.success(f"✅ Dispatched real email for **{n.concept_id}** to `{n.recipient}` via SMTP!")
+                            else:
+                                st.warning(f"⚠️ Generated reminder for **{n.concept_id}** in Simulated Mode (SMTP_HOST unset).")
                         else:
                             st.warning(f"Failed to send reminder for **{n.concept_id}**: {n.error}")
         else:
