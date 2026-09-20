@@ -2,7 +2,7 @@
 
 ```bash
 # 1. Clone the repository and navigate into the directory
-git clone "repo_url_here"
+git clone https://github.com/hypractiiv/agentathon-mindmesh.git
 cd MindMesh
 
 # 2. Install dependencies
