@@ -40,15 +40,19 @@ class LLMEvaluator:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
     ):
         self.mode = mode
-        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+        # OpenAI Configuration (Primary Live Grader)
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         self.base_url = (
             base_url
-            or os.getenv("OPENROUTER_BASE_URL")
-            or "https://openrouter.ai/api/v1"
+            or os.getenv("OPENAI_BASE_URL")
+            or ("https://api.openai.com/v1" if os.getenv("OPENAI_API_KEY") and not os.getenv("OPENROUTER_API_KEY") else "https://openrouter.ai/api/v1")
         )
-        self.model = model or os.getenv("MINDMESH_MODEL") or "google/gemini-2.0-flash-001"
+        self.model = model or os.getenv("OPENAI_MODEL") or os.getenv("MINDMESH_MODEL") or "gpt-4o-mini"
+        # Google Gemini Configuration (Fallback Live Grader)
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.session_call_counts: Dict[str, int] = {}
 
     def get_session_call_count(self, session_id: str) -> int:
@@ -63,7 +67,19 @@ class LLMEvaluator:
             )
         self.session_call_counts[session_id] = count + 1
 
-    def _load_system_prompt(self) -> str:
+    def _load_system_prompt(self, question: Optional[Question] = None) -> str:
+        if question and question.concept_id != "recursion_base_case":
+            topic_name = question.topic_name or question.concept_id
+            return (
+                f"You are an expert, objective computer science evaluator assessing student explanations on '{topic_name}'.\n"
+                "Your role is to assess whether the student's submission demonstrates genuine technical understanding "
+                "of the concept and justifies why the chosen answer is correct.\n\n"
+                "Evaluation Guidelines:\n"
+                "- Conceptual Soundness: Pass explanations that accurately articulate the underlying mechanism, time/space complexity, or technical rationale, even if variable naming differs (e.g. L for length vs P for prefix length) or phrasing is concise.\n"
+                "- Negative Cases: Fail explanations that contain factual errors, misunderstand the core concept, are admitted guesses (e.g. 'idk', 'lucky guess'), or fail to provide any meaningful technical justification.\n"
+                "- Constructive Assessment: Do not be overly pedantic about minor wording differences or requiring incidental details from the rubric if the core technical insight is correct.\n"
+                "- Output strictly valid JSON with fields: {\"passed\": bool, \"objection\": string or null, \"reasoning\": string}."
+            )
         if PROMPT_MD_PATH.exists():
             return PROMPT_MD_PATH.read_text(encoding="utf-8")
         return "You are an evaluator judging student answer correctness based on rubrics. Output JSON only."
@@ -81,7 +97,7 @@ class LLMEvaluator:
                 f"Concept / Topic: {topic_name}\n"
                 f"Question Asked: {question.prompt_text}\n"
                 f"{options_str}"
-                f"Specific Rubric Criteria:\n{rubric_str}\n\n"
+                f"Rubric Guidelines:\n{rubric_str}\n\n"
             )
         else:
             topic_info = "Concept / Topic: Recursion Base Case (List Summation)\n\n"
@@ -95,7 +111,7 @@ class LLMEvaluator:
             f"<STUDENT_ANSWER>\n{answer.student_answer}\n</STUDENT_ANSWER>\n"
             "=== UNTRUSTED STUDENT SUBMISSION DATA END ===\n\n"
             f"Student self-assessed rating: {answer.self_rating}/5 (Attempt #{answer.attempt_number})\n\n"
-            "Remember: Judge strictly whether the answer satisfies the rubric criteria. "
+            "Judge whether the student's submission demonstrates sound technical understanding of the core concept. "
             "Output JSON with fields: passed (bool), objection (string or null), reasoning (string)."
         )
 
@@ -109,23 +125,49 @@ class LLMEvaluator:
         """
         Evaluates a student's answer.
         Enforces spend cap (<=4 calls).
-        Dispatches to Fake or Real evaluator based on configuration.
+        Dispatches to:
+        1. Ground-truth deterministic comparison (for MCQ option choices A/B/C/D)
+        2. OpenAI live model evaluation (Primary)
+        3. Google Gemini model evaluation (Fallback)
+        4. Deterministic rule-based evaluation (Emergency Safety Net)
         """
         self._increment_and_check_spend_limit(session_id)
 
+        # 1. MCQ option selections are checked deterministically against ground truth:
+        if question and question.options and question.correct_option and not is_explanation:
+            return self._evaluate_rule_based_dynamic(answer, question, is_explanation=is_explanation)
+
+        has_key = bool(self.api_key or self.gemini_api_key)
+
         # In fake mode or if no API key is provided in auto mode, use deterministic rule evaluation
-        if self.mode == "fake" or (self.mode == "auto" and not self.api_key):
+        if self.mode == "fake" or (self.mode == "auto" and not has_key):
             verdict = self._evaluate_rule_based_dynamic(answer, question, is_explanation=is_explanation)
             return verdict
 
-        # Real LLM call via OpenRouter / OpenAI-compatible endpoint
-        try:
-            return self._call_real_model(answer, question)
-        except Exception as e:
-            # Resilient fallback to rule-based if network/remote fails
-            verdict = self._evaluate_rule_based_dynamic(answer, question, is_explanation=is_explanation)
-            verdict.reasoning = f"[Fallback: {str(e)[:60]}] {verdict.reasoning or ''}"
-            return verdict
+        fallback_errors: List[str] = []
+
+        # 2. Primary Live Grader: OpenAI
+        if self.api_key:
+            try:
+                return self._call_real_model(answer, question)
+            except Exception as e:
+                fallback_errors.append(f"OpenAI: {str(e)[:60]}")
+
+        # 3. Fallback Live Grader: Google Gemini
+        if self.gemini_api_key:
+            try:
+                verdict = self._call_gemini_model(answer, question)
+                if fallback_errors:
+                    verdict.reasoning = f"[Gemini Fallback: {'; '.join(fallback_errors)}] {verdict.reasoning or ''}"
+                return verdict
+            except Exception as e:
+                fallback_errors.append(f"Gemini: {str(e)[:60]}")
+
+        # 4. Final Emergency Fallback: Deterministic Rule-Based
+        verdict = self._evaluate_rule_based_dynamic(answer, question, is_explanation=is_explanation)
+        if fallback_errors:
+            verdict.reasoning = f"[Rule Fallback: {'; '.join(fallback_errors)}] {verdict.reasoning or ''}"
+        return verdict
 
     def _evaluate_rule_based_dynamic(
         self,
@@ -330,8 +372,52 @@ class LLMEvaluator:
                 is_mismatch=(answer.self_rating >= 4),
             )
 
+    def _call_gemini_model(self, answer: Answer, question: Optional[Question] = None) -> Verdict:
+        system_prompt = self._load_system_prompt(question)
+        user_prompt = self._format_user_prompt(answer, question)
+
+        candidate_models = [
+            self.model if "gemini" in self.model else "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-flash-lite-latest",
+            "gemini-flash-latest",
+            "gemini-2.0-flash",
+        ]
+        candidate_models = list(dict.fromkeys(candidate_models))
+
+        last_error = None
+        for model_name in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.gemini_api_key}"
+            payload = {
+                "system_instruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"parts": [{"text": user_prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.0,
+                },
+            }
+
+            try:
+                with httpx.Client(timeout=12.0) as client:
+                    resp = client.post(url, json=payload)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            raw_content = candidates[0]["content"]["parts"][0]["text"]
+                            return self._parse_verdict(raw_content, answer.self_rating)
+                    else:
+                        last_error = Exception(f"Gemini API HTTP {resp.status_code}: {resp.text[:80]}")
+            except Exception as e:
+                last_error = e
+                continue
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("Gemini evaluation returned empty response")
+
     def _call_real_model(self, answer: Answer, question: Optional[Question] = None) -> Verdict:
-        system_prompt = self._load_system_prompt()
+        system_prompt = self._load_system_prompt(question)
         user_prompt = self._format_user_prompt(answer, question)
 
         headers = {
